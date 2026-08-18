@@ -19,6 +19,8 @@ local _ = require("gettext")
 
 local DB_PATH = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
 local BACKUP_DIR = DataStorage:getSettingsDir() .. "/autostatsync-backups"
+local UPLOAD_DIR = DataStorage:getSettingsDir() .. "/autostatsync-upload"
+local UPLOAD_PATH = UPLOAD_DIR .. "/statistics.sqlite3"
 local MAX_BACKUPS = 10
 local OPEN_SYNC_DELAY_SECONDS = 3
 local WATCHDOG_SECONDS = 120
@@ -57,6 +59,54 @@ local function databaseIsValid(conn, database_name)
     return ok and result == "ok"
 end
 
+local function ensureDirectory(path)
+    if lfs.attributes(path, "mode") == "directory" then
+        return true
+    end
+    local ok, err = lfs.mkdir(path)
+    if not ok and lfs.attributes(path, "mode") ~= "directory" then
+        return false, err
+    end
+    return true
+end
+
+local function removeDatabaseFiles(path)
+    os.remove(path)
+    os.remove(path .. "-wal")
+    os.remove(path .. "-shm")
+end
+
+-- VACUUM INTO reads SQLite's complete transactional view, including committed
+-- frames still living in a WAL, and writes a standalone database. Copying the
+-- main .sqlite3 file directly is unsafe whenever a -wal file exists.
+local function createDatabaseSnapshot(source_path, destination_path)
+    removeDatabaseFiles(destination_path)
+    local source = SQ3.open(source_path)
+    local ok, err = pcall(
+        source.exec,
+        source,
+        "VACUUM main INTO " .. sqlQuote(destination_path) .. ";"
+    )
+    source:close()
+    if not ok then
+        removeDatabaseFiles(destination_path)
+        return false, err
+    end
+
+    local snapshot = SQ3.open(destination_path)
+    local valid = databaseIsValid(snapshot)
+    local source_check = SQ3.open(source_path)
+    local source_version = databaseVersion(source_check)
+    source_check:close()
+    local snapshot_version = databaseVersion(snapshot)
+    snapshot:close()
+    if not valid or source_version ~= snapshot_version then
+        removeDatabaseFiles(destination_path)
+        return false, "snapshot validation failed"
+    end
+    return true
+end
+
 local function rotateBackups()
     local backups = {}
     for filename in lfs.dir(BACKUP_DIR) do
@@ -71,12 +121,10 @@ local function rotateBackups()
 end
 
 local function backupLocalDatabase()
-    if lfs.attributes(BACKUP_DIR, "mode") ~= "directory" then
-        local ok, err = lfs.mkdir(BACKUP_DIR)
-        if not ok and lfs.attributes(BACKUP_DIR, "mode") ~= "directory" then
-            logger.err("AutoStatsSync: cannot create backup directory:", err)
-            return false
-        end
+    local directory_ok, directory_error = ensureDirectory(BACKUP_DIR)
+    if not directory_ok then
+        logger.err("AutoStatsSync: cannot create backup directory:", directory_error)
+        return false
     end
 
     local basename = os.date("statistics-%Y%m%d-%H%M%S")
@@ -87,9 +135,9 @@ local function backupLocalDatabase()
         suffix = suffix + 1
     end
 
-    local copy_error = ffiUtil.copyFile(DB_PATH, backup_path)
-    if copy_error ~= nil then
-        logger.err("AutoStatsSync: failed to back up statistics database:", copy_error)
+    local snapshot_ok, snapshot_error = createDatabaseSnapshot(DB_PATH, backup_path)
+    if not snapshot_ok then
+        logger.err("AutoStatsSync: failed to snapshot statistics database:", snapshot_error)
         return false
     end
     rotateBackups()
@@ -319,13 +367,21 @@ function AutoStatsSync:performSync(provider, server, interactive)
     local remote_folder = server.url:sub(-1) == "/" and server.url:sub(1, -2) or server.url
     local remote_path = remote_folder .. "/" .. ffiUtil.basename(DB_PATH)
     local response_code
+    local directory_ok, directory_error = ensureDirectory(UPLOAD_DIR)
+    if not directory_ok then
+        self:finishAttempt(false, _("Cannot create the temporary upload directory"), interactive)
+        logger.err("AutoStatsSync: cannot create upload directory:", directory_error)
+        return
+    end
 
     for attempt = 1, MAX_CONFLICT_RETRIES do
         os.remove(income_path)
+        removeDatabaseFiles(UPLOAD_PATH)
         local etag
         response_code, etag = provider.downloadFile(remote_path, income_path)
         if response_code ~= 200 and response_code ~= 404 then
             os.remove(income_path)
+            removeDatabaseFiles(UPLOAD_PATH)
             self:finishAttempt(false, _("WebDAV download failed; local data is safe"), interactive)
             return
         end
@@ -333,12 +389,22 @@ function AutoStatsSync:performSync(provider, server, interactive)
         local merged = AutoStatsSync.mergeDatabases(DB_PATH, cached_path, income_path)
         if not merged then
             os.remove(income_path)
+            removeDatabaseFiles(UPLOAD_PATH)
             self:finishAttempt(false, _("Database merge failed; no data was uploaded"), interactive)
             return
         end
         self:refreshCurrentBookCache()
 
-        response_code = provider.uploadFile(server.url, DB_PATH, etag, true)
+        local snapshot_ok, snapshot_error = createDatabaseSnapshot(DB_PATH, UPLOAD_PATH)
+        if not snapshot_ok then
+            os.remove(income_path)
+            removeDatabaseFiles(UPLOAD_PATH)
+            logger.err("AutoStatsSync: cannot create upload snapshot:", snapshot_error)
+            self:finishAttempt(false, _("Could not create a complete upload snapshot"), interactive)
+            return
+        end
+
+        response_code = provider.uploadFile(server.url, UPLOAD_PATH, etag, true)
         if response_code ~= 412 then
             break
         end
@@ -348,13 +414,19 @@ function AutoStatsSync:performSync(provider, server, interactive)
     os.remove(income_path)
     if type(response_code) == "number" and response_code >= 200 and response_code < 300 then
         os.remove(cached_path)
-        ffiUtil.copyFile(DB_PATH, cached_path)
+        local copy_error = ffiUtil.copyFile(UPLOAD_PATH, cached_path)
+        if copy_error ~= nil then
+            logger.warn("AutoStatsSync: could not update sync cache:", copy_error)
+        end
+        removeDatabaseFiles(UPLOAD_PATH)
         self:finishAttempt(true, _("Successfully synchronized"), interactive)
     elseif response_code == 412 then
+        removeDatabaseFiles(UPLOAD_PATH)
         self:finishAttempt(false, _("WebDAV kept changing; synchronization will retry later"), interactive)
     else
         -- The local database already contains the downloaded union at this
         -- point. A later run can safely retry the upload without losing it.
+        removeDatabaseFiles(UPLOAD_PATH)
         self:finishAttempt(false, _("Upload failed; merged data remains on this device"), interactive)
     end
 end
@@ -416,6 +488,8 @@ function AutoStatsSync:requestSync(reason, interactive)
             local ok, err = pcall(self.performSync, self, provider, server, interactive)
             if not ok then
                 logger.err("AutoStatsSync: unexpected synchronization error:", err)
+                os.remove(DB_PATH .. ".autostatsync-temp")
+                removeDatabaseFiles(UPLOAD_PATH)
                 self:finishAttempt(false, _("Unexpected sync error; local data is safe"), interactive)
             end
         end)
