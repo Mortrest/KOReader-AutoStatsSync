@@ -33,6 +33,7 @@ Restart KOReader completely. Repeat on both Kindle and Boox.
 ## Configure
 
 1. On both devices, configure the same server and folder under **Reading statistics → Cloud sync**.
+   The WebDAV server's start folder may be blank. A blank value means the WebDAV root and is valid. The Source and Destination folders in general CloudSync settings are for syncing book files and are not used by this plugin.
 2. Open a book and select **Tools → Automatic statistics sync**.
 3. Leave automatic open/close synchronization enabled.
 4. Keep **Only sync when Wi-Fi is already online** enabled if you do not want prompts or automatic Wi-Fi activation.

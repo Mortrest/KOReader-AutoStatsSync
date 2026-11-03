@@ -454,8 +454,12 @@ function AutoStatsSync:requestSync(reason, interactive)
         self:showError(_("Configure Reading statistics → Cloud sync first."), interactive)
         return
     end
-    if type(server.url) ~= "string" or server.url == "" then
-        self:showError(_("The Reading statistics WebDAV folder is invalid."), interactive)
+    -- KOReader represents the WebDAV server's root folder with an empty URL.
+    -- This is a valid selection: the cloud provider resolves "/statistics.sqlite3"
+    -- relative to the configured WebDAV address. Only a missing/non-string URL
+    -- means the Reading Statistics cloud target is malformed.
+    if type(server.url) ~= "string" then
+        self:showError(_("The Reading statistics WebDAV configuration is invalid."), interactive)
         return
     end
     if server.type ~= "webdav" then
